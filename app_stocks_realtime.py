@@ -1,7 +1,7 @@
 import streamlit as st
 import time
 from datetime import datetime
-from data_source_stocks import DataSource
+from data_source_realtime import DataSource
 
 st.set_page_config(page_title="Day Trading Monitor", layout="wide")
 
