@@ -15,27 +15,24 @@ def main():
     st.title("⚡ Momentum Command Center")
     data_source = DataSource()
     alert_threshold = 0.10
+    hourly_threshold = 1.0  # 1% threshold for the new row
 
     # Fetch Data
     with st.spinner("Analyzing market velocity..."):
         df = data_source.get_velocity_data()
 
     if not df.empty:
-        # --- TOP QUADRANTS (Alerts) ---
-        # We separate these into a distinct container at the top
+        # --- TOP QUADRANTS (Real-Time Alerts) ---
         with st.container(border=True):
             st.subheader("🚨 Real-Time Velocity Alerts (±0.1% Move)")
             
-            # Filter the alerts
             fast_up = df[df['2m Velocity %'] >= alert_threshold].sort_values('2m Velocity %', ascending=False)
             fast_down = df[df['2m Velocity %'] <= -alert_threshold].sort_values('2m Velocity %', ascending=True)
 
             q1, q2 = st.columns(2)
-            
             with q1:
                 st.markdown("### 📈 Bullish Spikes")
                 if not fast_up.empty:
-                    # Using a table for the top quadrant for high visibility
                     st.dataframe(fast_up[['Ticker', 'Index', '2m Velocity %', 'Price']], 
                                  hide_index=True, use_container_width=True)
                 else:
@@ -49,13 +46,28 @@ def main():
                 else:
                     st.info("No stocks trending down < -0.1% right now.")
 
-        st.write("") # Spacer
+        # --- NEW SECTION: HOURLY MOVERS (±1%) ---
+        st.write("") 
+        with st.container(border=True):
+            st.subheader("⏳ Hourly Trend Watch (±1.0% Move)")
+            
+            # Note: Ensure '1h Change %' matches the exact column name in your DataSource CSV/API
+            hourly_movers = df[df['1h Change %'].abs() >= hourly_threshold].sort_values('1h Change %', ascending=False)
+            
+            if not hourly_movers.empty:
+                st.dataframe(
+                    hourly_movers[['Ticker', 'Price', '1h Change %', '2m Velocity %']],
+                    hide_index=True,
+                    use_container_width=True
+                )
+            else:
+                st.info("No stocks moved more than 1% in the last hour.")
+
         st.divider()
 
         # --- MAIN LIST SECTION ---
         st.subheader("📊 All Monitored Stocks (Full List)")
         
-        # Styling and Sorting
         styled_df = df.sort_values('2m Velocity %', ascending=False).style.map(
             style_velocity, subset=['2m Velocity %']
         ).format(precision=3)

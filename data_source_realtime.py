@@ -5,7 +5,6 @@ import streamlit as st
 class DataSource:
     def __init__(self):
         # Top 15 liquid stocks per index for momentum tracking
-        # Total 60 tickers - Optimized to prevent Yahoo Finance throttling
         self.index_config = {
             "SMI": ["NESN.SW", "NOVN.SW", "ROG.SW", "UBSG.SW", "ZURN.SW", "ABBN.SW", "CFR.SW", "ALC.SW", "SREN.SW", "SIKA.SW", "LONN.SW", "GIVN.SW", "HOLN.SW", "GEBN.SW", "SCMN.SW"],
             "DAX": ["SAP.DE", "SIE.DE", "ALV.DE", "DTE.DE", "AIR.DE", "MBG.DE", "BMW.DE", "BAS.DE", "BAYN.DE", "ADS.DE", "IFX.DE", "MUV2.DE", "DHL.DE", "RWE.DE", "DBK.DE"],
@@ -17,7 +16,7 @@ class DataSource:
     def get_velocity_data(_self):
         """
         Fetches 1m data for velocity and 1d data for overviews.
-        Calculates 2-min momentum and monthly/weekly trends.
+        Calculates 2-min momentum and new 1-hour change tracking.
         """
         try:
             # 1. Prepare Tickers
@@ -29,10 +28,9 @@ class DataSource:
                         all_tickers.append(t)
                         ticker_to_index[t] = idx_name
 
-            # 2. Batch Download (Dual-Stream)
-            # We fetch 1-minute bars for the velocity quadrant
+            # 2. Batch Download
+            # Period "2d" is necessary for 1m interval to get a full hour of data reliably
             data_1m = yf.download(all_tickers, period="2d", interval="1m", group_by='ticker', progress=False)
-            # We fetch Daily bars for the 5D and 1M trend overviews
             data_1d = yf.download(all_tickers, period="35d", interval="1d", group_by='ticker', progress=False)
             
             if data_1m.empty or data_1d.empty:
@@ -42,32 +40,35 @@ class DataSource:
             
             for ticker in all_tickers:
                 try:
-                    # Access multi-index safely
                     if ticker not in data_1m.columns.get_level_values(0) or ticker not in data_1d.columns.get_level_values(0):
                         continue
                         
                     df_1m = data_1m[ticker].dropna()
                     df_1d = data_1d[ticker].dropna()
                     
-                    # Ensure we have enough data points for math
-                    if len(df_1m) < 3 or len(df_1d) < 22:
+                    # Check for enough data: 3 for 2m velocity, 61 for 1h change
+                    if len(df_1m) < 61 or len(df_1d) < 22:
                         continue
                     
-                    # --- 2-MINUTE VELOCITY (For Quadrants) ---
+                    # --- PRICE POINTS ---
                     curr_p = df_1m['Close'].iloc[-1]
+                    
+                    # --- 2-MINUTE VELOCITY ---
                     prev_2m_p = df_1m['Close'].iloc[-3]
                     velocity_2m = ((curr_p - prev_2m_p) / prev_2m_p) * 100
                     
+                    # --- 1-HOUR CHANGE (60 minutes) ---
+                    # Using -61 because -1 is current, so 60 bars ago is index -61
+                    prev_1h_p = df_1m['Close'].iloc[-61]
+                    change_1h = ((curr_p - prev_1h_p) / prev_1h_p) * 100
+
                     # --- TREND OVERVIEWS ---
-                    # 5-Day Total (Current vs 5 trading sessions ago)
                     p_5d_ago = df_1d['Close'].iloc[-6]
                     total_5d_pct = ((curr_p - p_5d_ago) / p_5d_ago) * 100
                     
-                    # 1-Month Total (Current vs Start of 35d window)
                     p_1m_ago = df_1d['Close'].iloc[0]
                     total_1m_pct = ((curr_p - p_1m_ago) / p_1m_ago) * 100
 
-                    # Today's session change (Current vs Today's Open)
                     today_open = df_1d['Open'].iloc[-1]
                     today_pct = ((curr_p - today_open) / today_open) * 100
                     
@@ -76,6 +77,7 @@ class DataSource:
                         'Ticker': ticker.split('.')[0],
                         'Price': round(curr_p, 2),
                         '2m Velocity %': round(velocity_2m, 3),
+                        '1h Change %': round(change_1h, 2), # New field for your dashboard
                         'Today %': round(today_pct, 2),
                         'Total 5D %': round(total_5d_pct, 2),
                         'Total 1M %': round(total_1m_pct, 2),
