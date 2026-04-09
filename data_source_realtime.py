@@ -6,109 +6,123 @@ from datetime import datetime
 
 class DataSource:
     def __init__(self):
-        self.index_config = {
-            "SMI": ["NESN.SW", "NOVN.SW", "ROG.SW", "UBSG.SW", "ZURN.SW", "ABBN.SW", "CFR.SW", "ALC.SW", "SREN.SW", "SIKA.SW", "LONN.SW", "GIVN.SW", "HOLN.SW", "GEBN.SW", "SCMN.SW"],
-            "DAX": ["SAP.DE", "SIE.DE", "ALV.DE", "DTE.DE", "AIR.DE", "MBG.DE", "BMW.DE", "BAS.DE", "BAYN.DE", "ADS.DE", "IFX.DE", "MUV2.DE", "DHL.DE", "RWE.DE", "DBK.DE"],
-            "SP500": ["AAPL", "MSFT", "AMZN", "NVDA", "GOOGL", "META", "BRK-B", "TSLA", "V", "JPM", "UNH", "JNJ", "XOM", "WMT", "MA"],
-            "NASDAQ": ["AAPL", "ADBE", "MSFT", "AMZN", "NVDA", "AVGO", "META", "COST", "PEP", "NFLX", "AMD", "CMCSA", "TMUS", "TXN", "INTC"]
+        # 1. Expanded and Deduplicated Index Configuration
+        raw_indices = {
+            "SMI": ["NESN.SW", "NOVN.SW", "ROG.SW", "UBSG.SW", "ZURN.SW", "ABBN.SW", "CFR.SW", "ALC.SW", "SREN.SW", "SIKA.SW", "LONN.SW", "GIVN.SW", "HOLN.SW", "GEBN.SW", "SCMN.SW", "SLHN.SW", "LOGN.SW", "PGHN.SW", "BAER.SW", "SANDO.SW"],
+            "DAX": ["SAP.DE", "SIE.DE", "ALV.DE", "DTE.DE", "AIR.DE", "MBG.DE", "BMW.DE", "BAS.DE", "BAYN.DE", "ADS.DE", "IFX.DE", "MUV2.DE", "DHL.DE", "RWE.DE", "DBK.DE", "ENR.DE", "RHM.DE", "HEI.DE", "CON.DE", "BEI.DE"],
+            "NASDAQ": ["AAPL", "MSFT", "AMZN", "NVDA", "AVGO", "META", "TSLA", "GOOGL", "GOOG", "COST", "NFLX", "ADBE", "AMD", "PEP", "TMUS", "TXN", "INTC", "AMGN", "ISRG"],
+            "SP500": ["BRK-B", "V", "JPM", "UNH", "JNJ", "XOM", "WMT", "MA", "LLY", "PG", "HD", "CVX", "ABBV", "MRK", "KO", "ORCL", "BAC", "SCHW", "TMO", "AVB"]
         }
-        self.cols = ['Index', 'Ticker', 'Price', '14d RSI', '2m Velocity %', '1h Change %', 'Today %', 'Last Sync']
+
+        self.index_config = {}
+        seen = set()
+        for idx, tickers in raw_indices.items():
+            unique = []
+            for t in tickers:
+                if t not in seen:
+                    unique.append(t)
+                    seen.add(t)
+            self.index_config[idx] = unique
+
+        # Added 'Volume' to the columns
+        self.cols = ['Index', 'Ticker', 'Price', '14d RSI', 'Volume', '2m Velocity %', '1h Change %', 'Today %', 'Last Sync']
 
     def calculate_rsi(self, series, period=14):
         delta = series.diff()
         gain = delta.clip(lower=0)
         loss = -1 * delta.clip(upper=0)
+        # Wilder's Smoothing (RMA)
         avg_gain = gain.ewm(com=period - 1, adjust=False).mean()
         avg_loss = loss.ewm(com=period - 1, adjust=False).mean()
         rs = avg_gain / avg_loss
         return 100 - (100 / (1 + rs))
 
-    # REDUCED TTL TO FORCE REFRESH
-    @st.cache_data(ttl=30)
-    def get_velocity_data(_self):
-        try:
-            all_tickers = []
-            ticker_to_index = {}
-            for idx_name, tickers in _self.index_config.items():
-                for t in tickers:
-                    if t not in all_tickers:
-                        all_tickers.append(t)
-                        ticker_to_index[t] = idx_name
+    def format_volume(self, volume):
+        if volume >= 1_000_000:
+            return f"{volume / 1_000_000:.2f}M"
+        if volume >= 1_000:
+            return f"{volume / 1_000:.1f}K"
+        return str(int(volume))
 
-            # Pulling 7 days ensures we ALWAYS have enough back-data for 1h calculation
+    @st.cache_data(ttl=60)
+    def get_market_data(_self):
+        try:
+            all_tickers = [t for sublist in _self.index_config.values() for t in sublist]
+            ticker_to_index = {t: idx for idx, tickers in _self.index_config.items() for t in tickers}
+
+            # Fetch data with 7-day 1m buffer to ensure "1h Change" works instantly
             data_1m = yf.download(all_tickers, period="7d", interval="1m", group_by='ticker', auto_adjust=True, progress=False)
             data_1d = yf.download(all_tickers, period="90d", interval="1d", group_by='ticker', auto_adjust=True, progress=False)
             
-            combined_results = []
+            results = []
             for ticker in all_tickers:
                 try:
                     df_1m = data_1m[ticker].dropna(subset=['Close'])
                     df_1d = data_1d[ticker].dropna(subset=['Close'])
                     
-                    if df_1m.empty or df_1d.empty:
-                        continue
+                    if df_1m.empty or df_1d.empty: continue
                     
                     curr_p = df_1m['Close'].iloc[-1]
                     
-                    # 1h Change %: If we have 61 mins, use it. If not, use the oldest available in the 7-day set.
+                    # 1. Volume Logic (Latest Daily Volume)
+                    raw_volume = df_1d['Volume'].iloc[-1]
+                    formatted_vol = _self.format_volume(raw_volume)
+
+                    # 2. 1h Change (Instant-on: uses 7-day buffer)
                     lookback_1h = min(61, len(df_1m))
-                    price_1h_ago = df_1m['Close'].iloc[-lookback_1h]
-                    change_1h = ((curr_p - price_1h_ago) / price_1h_ago) * 100
+                    change_1h = ((curr_p - df_1m['Close'].iloc[-lookback_1h]) / df_1m['Close'].iloc[-lookback_1h]) * 100
 
-                    # 2m Velocity
+                    # 3. 2m Velocity
                     lookback_2m = min(3, len(df_1m))
-                    price_2m_ago = df_1m['Close'].iloc[-lookback_2m]
-                    velocity_2m = ((curr_p - price_2m_ago) / price_2m_ago) * 100
+                    velocity_2m = ((curr_p - df_1m['Close'].iloc[-lookback_2m]) / df_1m['Close'].iloc[-lookback_2m]) * 100
 
-                    # RSI Anchor
+                    # 4. RSI Logic (Stable Daily Anchor)
                     history = df_1d['Close'].copy()
                     today_date = datetime.now().date()
                     history = history[history.index.date < today_date]
                     combined_close = pd.concat([history, pd.Series([curr_p])])
-                    
-                    rsi_series = _self.calculate_rsi(combined_close, period=14)
-                    current_rsi = rsi_series.iloc[-1]
+                    current_rsi = _self.calculate_rsi(combined_close).iloc[-1]
 
-                    # Today's Open from df_1d
-                    today_open = df_1d['Open'].iloc[-1]
-                    today_pct = ((curr_p - today_open) / today_open) * 100
-                    
-                    combined_results.append({
+                    results.append({
                         'Index': ticker_to_index[ticker],
                         'Ticker': ticker.split('.')[0],
                         'Price': round(curr_p, 2),
                         '14d RSI': round(current_rsi, 2),
+                        'Volume': formatted_vol,
                         '2m Velocity %': round(velocity_2m, 3),
                         '1h Change %': round(change_1h, 2),
-                        'Today %': round(today_pct, 2),
+                        'Today %': round(((curr_p - df_1d['Open'].iloc[-1]) / df_1d['Open'].iloc[-1]) * 100, 2),
                         'Last Sync': df_1m.index[-1].strftime('%H:%M:%S')
                     })
-                except:
-                    continue 
-
-            return pd.DataFrame(combined_results)
+                except: continue
+            return pd.DataFrame(results)
         except Exception as e:
             st.error(f"Error: {e}")
-            return pd.DataFrame(columns=_self.cols)
+            return pd.DataFrame()
 
 def main():
-    st.set_page_config(page_title="Momentum Tracker", layout="wide")
-    st.title("⚡ Momentum & RSI Command Center")
+    st.set_page_config(page_title="Market Terminal", layout="wide")
+    st.title("📊 Live Momentum & Volume Dashboard")
     
-    # ADDED: Button to manually clear cache if it gets stuck
-    if st.button('Force Refresh Data'):
+    if st.button('Force Refresh'):
         st.cache_data.clear()
         st.rerun()
 
     ds = DataSource()
-    df = ds.get_velocity_data()
+    df = ds.get_market_data()
     
-    # REMOVED the "Awaiting data" message block that was stuck on your screen
     if not df.empty:
-        df_sorted = df.sort_values('1h Change %', ascending=False)
-        st.dataframe(df_sorted, use_container_width=True, hide_index=True)
+        # Highlighting logic for the 1% moves you're looking for
+        def style_rows(row):
+            color = ''
+            if row['1h Change %'] >= 1.0: color = 'background-color: #052e16' # Dark Green
+            elif row['1h Change %'] <= -1.0: color = 'background-color: #450a0a' # Dark Red
+            return [color] * len(row)
+
+        st.dataframe(df.sort_values('1h Change %', ascending=False).style.apply(style_rows, axis=1), 
+                     use_container_width=True, hide_index=True)
     else:
-        st.warning("No live data found. Ensure market is open or check internet connection.")
+        st.info("Loading initial market data...")
 
 if __name__ == "__main__":
     main()
