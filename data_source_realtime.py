@@ -18,13 +18,13 @@ class DataSource:
         delta = series.diff()
         gain = delta.clip(lower=0)
         loss = -1 * delta.clip(upper=0)
-        # Use com=period-1 for exact Wilder's Smoothing
-        avg_gain = gain.ewm(com=period - 1, min_periods=period).mean()
-        avg_loss = loss.ewm(com=period - 1, min_periods=period).mean()
+        # Wilder's Smoothing (RMA) logic
+        avg_gain = gain.ewm(com=period - 1, adjust=False).mean()
+        avg_loss = loss.ewm(com=period - 1, adjust=False).mean()
         rs = avg_gain / avg_loss
         return 100 - (100 / (1 + rs))
 
-    @st.cache_data(ttl=115)
+    @st.cache_data(ttl=60)
     def get_velocity_data(_self):
         try:
             all_tickers = []
@@ -35,43 +35,40 @@ class DataSource:
                         all_tickers.append(t)
                         ticker_to_index[t] = idx_name
 
-            # AUTO_ADJUST=True is critical for RSI accuracy
-            data_1m = yf.download(all_tickers, period="2d", interval="1m", group_by='ticker', auto_adjust=True, progress=False)
+            # FIX: Download "5d" for 1m interval to ensure we ALWAYS have 60+ mins of history available immediately
+            data_1m = yf.download(all_tickers, period="5d", interval="1m", group_by='ticker', auto_adjust=True, progress=False)
             data_1d = yf.download(all_tickers, period="90d", interval="1d", group_by='ticker', auto_adjust=True, progress=False)
             
             combined_results = []
             for ticker in all_tickers:
                 try:
-                    # Cleanly extract the ticker's data to avoid MultiIndex leakage
                     df_1m = data_1m[ticker].dropna(subset=['Close'])
                     df_1d = data_1d[ticker].dropna(subset=['Close'])
                     
-                    if len(df_1m) < 61 or len(df_1d) < 30:
+                    # If we have at least 61 data points (from today + yesterday), we can calculate the 1h change instantly
+                    if len(df_1m) < 61:
                         continue
                     
                     curr_p = df_1m['Close'].iloc[-1]
                     
-                    # Short term velocity
-                    prev_2m_p = df_1m['Close'].iloc[-3]
-                    velocity_2m = ((curr_p - prev_2m_p) / prev_2m_p) * 100
-                    
-                    # --- THE FIX FOR ADOBE ---
-                    # 1. Get ONLY historical closes (excluding today)
+                    # 1h Change % using the 61st candle back (regardless of if it was yesterday or today)
+                    price_1h_ago = df_1m['Close'].iloc[-61]
+                    change_1h = ((curr_p - price_1h_ago) / price_1h_ago) * 100
+
+                    # 2m Velocity
+                    price_2m_ago = df_1m['Close'].iloc[-3]
+                    velocity_2m = ((curr_p - price_2m_ago) / price_2m_ago) * 100
+
+                    # RSI Anchor (Daily)
                     history = df_1d['Close'].copy()
                     today_date = datetime.now().date()
                     history = history[history.index.date < today_date]
-                    
-                    # 2. Re-verify the history is long enough
-                    if len(history) < 14: continue
-
-                    # 3. Append today's live price as the final data point
                     combined_close = pd.concat([history, pd.Series([curr_p])])
                     
-                    # 4. Calculate RSI on this "Clean" sequence
                     rsi_series = _self.calculate_rsi(combined_close, period=14)
                     current_rsi = rsi_series.iloc[-1]
 
-                    # Verify Today % against the actual Daily Open
+                    # Today's performance relative to Daily Open
                     today_open = df_1d['Open'].iloc[-1]
                     today_pct = ((curr_p - today_open) / today_open) * 100
                     
@@ -81,13 +78,35 @@ class DataSource:
                         'Price': round(curr_p, 2),
                         '14d RSI': round(current_rsi, 2),
                         '2m Velocity %': round(velocity_2m, 3),
-                        '1h Change %': round(((curr_p - df_1m['Close'].iloc[-61]) / df_1m['Close'].iloc[-61]) * 100, 2),
+                        '1h Change %': round(change_1h, 2),
                         'Today %': round(today_pct, 2),
                         'Last Sync': df_1m.index[-1].strftime('%H:%M:%S')
                     })
-                except: continue 
+                except:
+                    continue 
 
             return pd.DataFrame(combined_results)
         except Exception as e:
             st.error(f"Error: {e}")
             return pd.DataFrame(columns=_self.cols)
+
+def main():
+    st.set_page_config(page_title="Instant Impulse Tracker", layout="wide")
+    st.title("⚡ Real-Time Market Impulse")
+    
+    ds = DataSource()
+    df = ds.get_velocity_data()
+    
+    if not df.empty:
+        # Highlight stocks moving more than 1% in an hour
+        def highlight_surge(row):
+            return ['background-color: #1b4d3e' if abs(row['1h Change %']) >= 1.0 else '' for _ in row]
+
+        # Sort by the 1h Change so you see the biggest movers first
+        df_sorted = df.sort_values('1h Change %', ascending=False)
+        st.dataframe(df_sorted.style.apply(highlight_surge, axis=1), use_container_width=True, hide_index=True)
+    else:
+        st.info("Fetching data... Markets may be closed or tickers are updating.")
+
+if __name__ == "__main__":
+    main()
